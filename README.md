@@ -9,7 +9,7 @@ Gokapi 适合“上传文件 → 生成分享链接 → 让其他人下载”的
 在全新的 Debian 13 服务器上执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/brian952700/gokapi/main/gokapi.sh | sudo bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/brian952700/gokapi/main/gokapi.sh | bash -s -- install
 ```
 
 安装完成后访问：
