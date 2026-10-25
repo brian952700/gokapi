@@ -1,4 +1,4 @@
-# Gokapi Debian 13 一键安装
+# Gokapi Debian 12+ 一键安装
 
 这是一个面向个人服务器的 **Gokapi 原生安装与管理脚本**。它不会修改旧的 `filebrowser` 仓库，也不使用 Docker。
 
@@ -6,7 +6,7 @@ Gokapi 适合“上传文件 → 生成分享链接 → 让其他人下载”的
 
 ## 一键安装
 
-在全新的 Debian 13 服务器上执行：
+在 Debian 12 或更高版本的服务器上执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/brian952700/gokapi/main/gokapi.sh | bash -s -- install
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/brian952700/gokapi/main/gokapi.sh |
 
 ## 支持范围
 
-- 操作系统：Debian 13（脚本会严格检查）
+- 操作系统：Debian 12 及以上版本（脚本会严格检查）
 - 架构：`amd64`、`arm64`、`armhf`、`riscv64`
 - Gokapi：固定并校验官方稳定版 `v2.2.4`
 - 服务管理：systemd

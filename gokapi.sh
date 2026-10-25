@@ -26,7 +26,7 @@ trap cleanup EXIT
 
 usage() {
   cat <<'EOF'
-Gokapi Debian 13 一键管理脚本
+Gokapi Debian 12+ 一键管理脚本
 
 用法：
   gokapi.sh install           安装或覆盖更新 Gokapi
@@ -41,12 +41,17 @@ require_root() {
   [[ ${EUID} -eq 0 ]] || die "请使用 root 运行，或在命令前加 sudo。"
 }
 
-check_debian_13() {
+check_debian_version() {
   [[ -r /etc/os-release ]] || die "无法读取 /etc/os-release。"
   # shellcheck disable=SC1091
   source /etc/os-release
-  [[ ${ID:-} == "debian" && ${VERSION_ID:-} == "13" ]] ||
-    die "本脚本仅支持 Debian 13；当前系统为 ${PRETTY_NAME:-未知}。"
+  [[ ${ID:-} == "debian" ]] ||
+    die "本脚本仅支持 Debian；当前系统为 ${PRETTY_NAME:-未知}。"
+  [[ ${VERSION_ID:-} =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+    die "无法识别 Debian 版本：${VERSION_ID:-未知}。"
+  local major_version="${VERSION_ID%%.*}"
+  ((10#${major_version} >= 12)) ||
+    die "本脚本仅支持 Debian 12 及以上版本；当前系统为 ${PRETTY_NAME:-未知}。"
   command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd。"
 }
 
@@ -172,7 +177,7 @@ EOF
 install_gokapi() {
   local first_install=false server_ip
   [[ -x "$BINARY_PATH" ]] || first_install=true
-  check_debian_13
+  check_debian_version
   validate_port
   install_dependencies
   release_for_arch
