@@ -36,6 +36,16 @@ curl -fsSL https://raw.githubusercontent.com/brian952700/gokapi/main/gokapi.sh |
 
 发布包会使用写在脚本中的官方 SHA-256 摘要进行校验，校验失败时不会安装。
 
+## 安装交互
+
+脚本会用分阶段编号、颜色和状态符号展示安装进度，并在完成后集中显示访问地址、服务状态和日志命令。下载官方发布包时，交互终端中会显示进度条。
+
+在日志系统、CI 或不支持 ANSI 颜色的终端中，脚本会自动使用纯文本输出。也可以手动关闭颜色：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/brian952700/gokapi/main/gokapi.sh | NO_COLOR=1 bash -s -- install
+```
+
 ## 管理命令
 
 下载脚本后也可以重复使用：
