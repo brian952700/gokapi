@@ -149,7 +149,7 @@ check_debian_version() {
   local major_version="${VERSION_ID%%.*}"
   ((10#${major_version} >= 12)) ||
     die "本脚本仅支持 Debian 12 及以上版本；当前系统为 ${PRETTY_NAME:-未知}。"
-  command -v systemctl >/dev/null 2>&1 && systemctl show -p Version --value >/dev/null ||
+  systemctl show -p Version --value >/dev/null 2>&1 ||
     die "无法连接 systemd 服务管理器。"
 }
 
