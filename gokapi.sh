@@ -37,6 +37,7 @@ snapshot_installation() {
 
 restore_installation() {
   local path load_state
+  effective_port="$previous_port"
   load_state="$(systemctl show -p LoadState --value "$SERVICE_NAME")" || return 1
   if [[ "$load_state" != not-found ]]; then
     systemctl stop "$SERVICE_NAME" || return 1
@@ -163,6 +164,7 @@ install_dependencies() {
   local missing=()
   command -v curl >/dev/null 2>&1 || missing+=(curl)
   command -v unzip >/dev/null 2>&1 || missing+=(unzip)
+  command -v ss >/dev/null 2>&1 || missing+=(iproute2)
   dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'ok installed' || missing+=(ca-certificates)
   if ((${#missing[@]} > 0)); then
     info "需要安装：${missing[*]}"
@@ -281,7 +283,11 @@ EOF
 }
 
 probe_web() {
-  local scheme route code
+  local scheme route code pid listeners
+  pid="$(systemctl show -p MainPID --value "$SERVICE_NAME")" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  listeners="$(ss -H -ltnp "sport = :$effective_port")" || return 1
+  [[ "$listeners" == *"pid=$pid,"* ]] || return 1
   route=/setup
   if [[ -s "$CONFIG_DIR/config.json" ]]; then route=/admin; fi
   for scheme in http https; do
@@ -328,10 +334,12 @@ install_gokapi() {
   fi
   validate_port
   effective_port=$((10#$effective_port))
+  previous_port="$effective_port"
   if [[ -r "$CONFIG_DIR/installed-version" ]]; then
     IFS= read -r installed_version <"$CONFIG_DIR/installed-version" || true
   fi
   if [[ "${1:-}" != --force && "$installed_version" == "$GOKAPI_VERSION" && -x "$BINARY_PATH" ]] &&
+    command -v curl >/dev/null && command -v ss >/dev/null &&
     systemctl is-active --quiet "$SERVICE_NAME" && probe_web; then
     success "Gokapi v${GOKAPI_VERSION} 已在运行，跳过下载和重启。"
     detail "后台路径" "$web_route"
