@@ -21,3 +21,32 @@ jobs:
         run: bash -n gokapi.sh
       - name: Run ShellCheck
         run: shellcheck gokapi.sh
+  systemd-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise install, repeat, lock and rollback
+        run: |
+          # This disposable runner provides real systemd. Bypass only the distro gate.
+          sed '/^check_debian_version() {$/,/^}$/c\check_debian_version() { systemctl show -p Version --value >/dev/null; }' gokapi.sh > /tmp/gokapi-test.sh
+          sudo bash /tmp/gokapi-test.sh install
+          pid=$(systemctl show -p MainPID --value gokapi)
+          sudo bash /tmp/gokapi-test.sh install
+          test "$pid" = "$(systemctl show -p MainPID --value gokapi)"
+          if sudo flock /run/lock/gokapi-installer.lock bash /tmp/gokapi-test.sh update; then
+            echo 'Concurrent update unexpectedly succeeded'
+            exit 1
+          fi
+          sed 's|^ExecStart=.*|ExecStart=/usr/bin/false|' /tmp/gokapi-test.sh > /tmp/gokapi-broken.sh
+          if sudo bash /tmp/gokapi-broken.sh update --force; then
+            echo 'Broken update unexpectedly succeeded'
+            exit 1
+          fi
+          systemctl is-active --quiet gokapi
+          curl --fail --silent --output /dev/null http://127.0.0.1:53842/setup
+          sudo bash /tmp/gokapi-test.sh uninstall
+          sudo test -d /var/lib/gokapi
+      - name: Show service logs on failure
+        if: failure()
+        run: sudo journalctl -u gokapi --no-pager -n 80

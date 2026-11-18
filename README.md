@@ -85,7 +85,9 @@ sudo journalctl -u gokapi -f
 
 ## 更新说明
 
-运行 `update` 会重新下载并校验脚本固定的 Gokapi 版本，然后原子替换二进制并重启服务；现有配置和文件不会被覆盖。
+运行 `update` 时，如果目标版本已经安装且 Web 服务正常，脚本会跳过下载和重启。需要重装同一版本时，运行 `bash gokapi.sh update --force`（需要 root 权限）。安装、更新和卸载使用同一把锁。
+
+脚本会检查本机 Web 服务是否就绪。启动失败时会尝试恢复旧程序和服务配置。跨版本更新前，请先备份 `/etc/gokapi`、`/var/lib/gokapi` 以及单独部署的数据库或存储，再以 root 运行 `GOKAPI_BACKUP_CONFIRMED=1 bash gokapi.sh update`。如果新版本已经迁移数据库，请根据备份恢复数据。
 
 当上游发布新版本时，需要先更新本仓库中的版本号和各架构 SHA-256，再运行更新命令。
 

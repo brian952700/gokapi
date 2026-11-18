@@ -13,6 +13,52 @@ readonly DATA_DIR="/var/lib/gokapi"
 readonly DEFAULT_PORT="${GOKAPI_PORT:-53842}"
 
 tmp_dir=""
+rollback_dir=""
+was_active=false
+was_enabled=false
+
+lock_operations() {
+  exec 9>/run/lock/gokapi-installer.lock
+  flock -n 9 || die "另一个 Gokapi 管理操作正在运行，请稍后重试。"
+}
+
+snapshot_installation() {
+  local path backup
+  backup="$(mktemp -d "${BINARY_PATH}.rollback.XXXXXXXX")"
+  for path in "$BINARY_PATH" "$UNIT_PATH" "$ENV_PATH"; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      cp -a -- "$path" "$backup/${path//\//_}"
+    fi
+  done
+  if systemctl is-active --quiet "$SERVICE_NAME"; then was_active=true; fi
+  if systemctl is-enabled --quiet "$SERVICE_NAME"; then was_enabled=true; fi
+  rollback_dir="$backup"
+}
+
+restore_installation() {
+  local path load_state
+  effective_port="$previous_port"
+  load_state="$(systemctl show -p LoadState --value "$SERVICE_NAME")" || return 1
+  if [[ "$load_state" != not-found ]]; then
+    systemctl stop "$SERVICE_NAME" || return 1
+  fi
+  if [[ "$was_enabled" == false && -f "$UNIT_PATH" ]]; then
+    systemctl disable "$SERVICE_NAME" || return 1
+  fi
+  for path in "$BINARY_PATH" "$UNIT_PATH" "$ENV_PATH"; do
+    if [[ -e "$rollback_dir/${path//\//_}" || -L "$rollback_dir/${path//\//_}" ]]; then
+      cp -a --remove-destination -- "$rollback_dir/${path//\//_}" "$path" || return 1
+    else
+      rm -f -- "$path" || return 1
+    fi
+  done
+  systemctl daemon-reload || return 1
+  if [[ "$was_active" == true ]]; then
+    systemctl reset-failed "$SERVICE_NAME" || true
+    systemctl start "$SERVICE_NAME" || return 1
+    wait_until_ready || return 1
+  fi
+}
 
 if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != "dumb" ]]; then
   readonly RESET=$'\033[0m'
@@ -50,11 +96,23 @@ die() {
 }
 
 cleanup() {
+  local status=$?
+  trap - ERR
+  if [[ -n "$rollback_dir" ]]; then
+    if ((status == 0)) || restore_installation; then
+      rm -rf -- "$rollback_dir"
+      if ((status != 0)); then warning "已恢复安装前的程序、服务和启动状态。"; fi
+    else
+      error "自动恢复失败，备份保留在 $rollback_dir"
+    fi
+  fi
   if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
     rm -rf -- "$tmp_dir"
   fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 on_error() {
   local exit_code=$?
@@ -67,8 +125,8 @@ usage() {
   banner
   cat <<'EOF'
 用法：
-  gokapi.sh install           安装或覆盖更新 Gokapi
-  gokapi.sh update            更新到脚本固定的稳定版本
+  gokapi.sh install [--force] 安装 Gokapi（--force 强制重装）
+  gokapi.sh update [--force]  更新到固定版本（--force 强制重装）
   gokapi.sh status            查看 systemd 服务状态
   gokapi.sh uninstall         卸载程序，保留配置和文件
   gokapi.sh purge --yes       完全卸载，并删除配置和全部文件
@@ -91,13 +149,14 @@ check_debian_version() {
   local major_version="${VERSION_ID%%.*}"
   ((10#${major_version} >= 12)) ||
     die "本脚本仅支持 Debian 12 及以上版本；当前系统为 ${PRETTY_NAME:-未知}。"
-  command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd。"
+  systemctl show -p Version --value >/dev/null 2>&1 ||
+    die "无法连接 systemd 服务管理器。"
 }
 
 validate_port() {
-  [[ "$DEFAULT_PORT" =~ ^[0-9]+$ ]] ||
+  [[ "$effective_port" =~ ^[0-9]{1,5}$ ]] ||
     die "GOKAPI_PORT 必须是 1 到 65535 之间的整数。"
-  ((DEFAULT_PORT >= 1 && DEFAULT_PORT <= 65535)) ||
+  ((10#$effective_port >= 1 && 10#$effective_port <= 65535)) ||
     die "GOKAPI_PORT 必须是 1 到 65535 之间的整数。"
 }
 
@@ -105,6 +164,7 @@ install_dependencies() {
   local missing=()
   command -v curl >/dev/null 2>&1 || missing+=(curl)
   command -v unzip >/dev/null 2>&1 || missing+=(unzip)
+  command -v ss >/dev/null 2>&1 || missing+=(iproute2)
   dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'ok installed' || missing+=(ca-certificates)
   if ((${#missing[@]} > 0)); then
     info "需要安装：${missing[*]}"
@@ -150,7 +210,7 @@ download_binary() {
   if [[ -t 2 ]]; then
     curl_display=(--progress-bar --show-error)
   fi
-  curl --fail --location "${curl_display[@]}" --retry 3 --retry-delay 2 \
+  curl --fail --location "${curl_display[@]}" --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 --retry-max-time 150 \
     --output "$archive" "$url"
   info "正在校验 SHA-256"
   printf '%s  %s\n' "$RELEASE_SHA256" "$archive" | sha256sum --check --status ||
@@ -191,7 +251,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
+Type=exec
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${DATA_DIR}
@@ -222,67 +282,117 @@ WantedBy=multi-user.target
 EOF
 }
 
-install_gokapi() {
-  local first_install=false server_ip
-  [[ -x "$BINARY_PATH" ]] || first_install=true
+probe_web() {
+  local scheme route code pid listeners
+  pid="$(systemctl show -p MainPID --value "$SERVICE_NAME")" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  listeners="$(ss -H -ltnp "sport = :$effective_port")" || return 1
+  [[ "$listeners" == *"pid=$pid,"* ]] || return 1
+  route=/setup
+  if [[ -s "$CONFIG_DIR/config.json" ]]; then route=/admin; fi
+  for scheme in http https; do
+    # The local service may use a self-signed certificate.
+    code="$(curl --insecure --silent --noproxy '*' --max-time 2 \
+      --output /dev/null --write-out '%{http_code}' \
+      "$scheme://127.0.0.1:$effective_port$route" 2>/dev/null)" || continue
+    if [[ "$code" == 200 || "$code" == 30[12378] ]]; then
+      web_scheme="$scheme"
+      web_route="$route"
+      return 0
+    fi
+  done
+  return 1
+}
 
+wait_until_ready() {
+  local deadline=$((SECONDS + 30)) pid
+  while ((SECONDS < deadline)); do
+    pid="$(systemctl show -p MainPID --value "$SERVICE_NAME")" || return 1
+    if [[ "$pid" != 0 && -n "$pid" ]] &&
+      systemctl is-active --quiet "$SERVICE_NAME" &&
+      probe_web &&
+      [[ "$(systemctl show -p MainPID --value "$SERVICE_NAME")" == "$pid" ]] &&
+      systemctl is-active --quiet "$SERVICE_NAME"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+install_gokapi() {
+  local server_ip installed_version=""
+  effective_port="$DEFAULT_PORT"
+  web_scheme=http
+  web_route=/setup
   banner
   step 1 7 "检查运行环境"
   check_debian_version
+  release_for_arch
+  if [[ -f "$ENV_PATH" ]]; then
+    effective_port="$(awk -F= '/^GOKAPI_PORT=[0-9]+$/ { port=$2 } END { print (port == "" ? 53842 : port) }' "$ENV_PATH")"
+  fi
   validate_port
-  success "系统版本与运行环境符合要求"
-  detail "系统" "${PRETTY_NAME:-Debian}"
-  detail "端口" "$DEFAULT_PORT"
+  effective_port=$((10#$effective_port))
+  previous_port="$effective_port"
+  if [[ -r "$CONFIG_DIR/installed-version" ]]; then
+    IFS= read -r installed_version <"$CONFIG_DIR/installed-version" || true
+  fi
+  if [[ "${1:-}" != --force && "$installed_version" == "$GOKAPI_VERSION" && -x "$BINARY_PATH" ]] &&
+    command -v curl >/dev/null && command -v ss >/dev/null &&
+    systemctl is-active --quiet "$SERVICE_NAME" && probe_web; then
+    success "Gokapi v${GOKAPI_VERSION} 已在运行，跳过下载和重启。"
+    detail "后台路径" "$web_route"
+    return
+  fi
+  success "系统版本与处理器架构符合要求"
+  detail "端口" "$effective_port"
 
   step 2 7 "检查系统依赖"
   install_dependencies
-
-  step 3 7 "检测处理器架构"
-  release_for_arch
-  success "已匹配 linux-${RELEASE_ARCH} 发布包"
-
+  step 3 7 "确认发布包"
+  info "linux-${RELEASE_ARCH} · v${GOKAPI_VERSION}"
   step 4 7 "下载并验证 Gokapi"
   download_binary
-
   step 5 7 "准备服务账户与数据目录"
   ensure_service_user
-  success "账户和目录准备完成"
-  detail "运行用户" "$SERVICE_USER"
-  detail "数据目录" "$DATA_DIR"
+  if [[ -s "$CONFIG_DIR/config.json" && "$installed_version" != "$GOKAPI_VERSION" && "${GOKAPI_BACKUP_CONFIRMED:-}" != 1 ]]; then
+    die "跨版本更新前，请备份配置、上传文件和数据库，再以 GOKAPI_BACKUP_CONFIRMED=1 重试。"
+  fi
+  snapshot_installation
 
   step 6 7 "安装程序与 systemd 服务"
-  install -o root -g root -m 0755 "${tmp_dir}/gokapi" "${BINARY_PATH}.new"
-  mv -f "${BINARY_PATH}.new" "$BINARY_PATH"
+  install -o root -g root -m 0755 "${tmp_dir}/gokapi" "$rollback_dir/new-binary"
+  mv -fT -- "$rollback_dir/new-binary" "$BINARY_PATH"
   write_environment
   write_unit
-  printf '%s\n' "$GOKAPI_VERSION" >"${CONFIG_DIR}/installed-version"
-  chown root:"$SERVICE_USER" "${CONFIG_DIR}/installed-version"
-  chmod 0640 "${CONFIG_DIR}/installed-version"
-  success "程序文件和服务配置已写入"
 
   step 7 7 "启动并验证服务"
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
-  if [[ "$first_install" == false ]]; then systemctl restart "$SERVICE_NAME"; fi
-  if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+  systemctl restart "$SERVICE_NAME"
+  if ! wait_until_ready; then
     journalctl -u "$SERVICE_NAME" -n 30 --no-pager >&2 || true
-    die "服务未能启动，请查看上面的日志。"
+    die "Web 服务未就绪，请查看日志和端口设置。"
   fi
-  success "Gokapi 服务正在运行，并已设置为开机启动"
+  systemctl enable "$SERVICE_NAME"
+  printf '%s\n' "$GOKAPI_VERSION" >"$tmp_dir/installed-version"
+  install -o root -g "$SERVICE_USER" -m 0640 "$tmp_dir/installed-version" "$CONFIG_DIR/installed-version"
+  rm -rf -- "$rollback_dir"
+  rollback_dir=""
 
-  server_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  server_ip="$(hostname -I 2>/dev/null | awk '{print $1}')" || server_ip=""
   [[ -n "$server_ip" ]] || server_ip="服务器IP"
-
+  if [[ "$server_ip" == *:* ]]; then server_ip="[$server_ip]"; fi
   printf '\n'
   print_rule
-  printf '%b\n' "  ${GREEN}${BOLD}安装完成！${RESET}"
-  print_rule
-  detail "版本" "Gokapi v${GOKAPI_VERSION}"
-  detail "配置地址" "${BOLD}http://${server_ip}:${DEFAULT_PORT}/setup${RESET}"
+  success "Gokapi v${GOKAPI_VERSION} 已就绪"
+  detail "访问地址" "$web_scheme://$server_ip:$effective_port$web_route"
   detail "查看状态" "systemctl status ${SERVICE_NAME}"
   detail "实时日志" "journalctl -u ${SERVICE_NAME} -f"
   print_rule
-  warning "请立即完成管理员配置；公网使用时建议配置 HTTPS 反向代理。"
+  if [[ "$web_route" == /setup ]]; then
+    warning "请立即完成管理员配置，之后访问 /admin 上传文件。"
+  fi
   printf '\n'
 }
 
@@ -298,13 +408,16 @@ uninstall_gokapi() {
   require_root
   banner
   step 1 2 "停止并移除 systemd 服务"
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+  local load_state
+  load_state="$(systemctl show --property=LoadState --value "$SERVICE_NAME")"
+  if [[ "$load_state" != not-found ]]; then
+    [[ -f "$UNIT_PATH" ]] || die "检测到由其他方式安装的服务，请使用原安装方式卸载。"
+    systemctl disable --now "$SERVICE_NAME"
   fi
   success "服务已停止"
   step 2 2 "移除程序文件"
   rm -f -- "$UNIT_PATH" "$BINARY_PATH" "$ENV_PATH"
-  systemctl daemon-reload 2>/dev/null || true
+  systemctl daemon-reload
   success "程序和服务已卸载"
   warning "配置 ${CONFIG_DIR} 与文件 ${DATA_DIR} 已保留。"
   printf '\n'
@@ -315,18 +428,23 @@ purge_gokapi() {
   [[ ${1:-} == "--yes" ]] || die "完全卸载会删除所有配置和上传文件；确认请运行：$0 purge --yes"
   uninstall_gokapi
   rm -rf -- "$CONFIG_DIR" "$DATA_DIR"
-  if id "$SERVICE_USER" >/dev/null 2>&1; then userdel "$SERVICE_USER" 2>/dev/null || true; fi
-  if getent group "$SERVICE_USER" >/dev/null; then groupdel "$SERVICE_USER" 2>/dev/null || true; fi
+  if id "$SERVICE_USER" >/dev/null 2>&1; then userdel "$SERVICE_USER"; fi
+  if getent group "$SERVICE_USER" >/dev/null; then groupdel "$SERVICE_USER"; fi
   success "配置、上传文件和服务账户已全部删除。"
   printf '\n'
 }
 
 main() {
   case ${1:-} in
-    install|update) require_root; install_gokapi ;;
+    install|update)
+      [[ $# -eq 1 || ( $# -eq 2 && "$2" == --force ) ]] || die "可选参数：--force"
+      require_root
+      lock_operations
+      install_gokapi "${2:-}"
+      ;;
     status) show_status ;;
-    uninstall) uninstall_gokapi ;;
-    purge) purge_gokapi "${2:-}" ;;
+    uninstall) require_root; lock_operations; uninstall_gokapi ;;
+    purge) require_root; lock_operations; purge_gokapi "${2:-}" ;;
     -h|--help|help|"") usage ;;
     *) usage >&2; exit 2 ;;
   esac
