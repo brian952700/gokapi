@@ -27,7 +27,7 @@ snapshot_installation() {
   backup="$(mktemp -d "${BINARY_PATH}.rollback.XXXXXXXX")"
   for path in "$BINARY_PATH" "$UNIT_PATH" "$ENV_PATH"; do
     if [[ -e "$path" || -L "$path" ]]; then
-      cp -a -- "$path" "$backup/${path##*/}"
+      cp -a -- "$path" "$backup/${path//\//_}"
     fi
   done
   if systemctl is-active --quiet "$SERVICE_NAME"; then was_active=true; fi
@@ -46,8 +46,8 @@ restore_installation() {
     systemctl disable "$SERVICE_NAME" || return 1
   fi
   for path in "$BINARY_PATH" "$UNIT_PATH" "$ENV_PATH"; do
-    if [[ -e "$rollback_dir/${path##*/}" || -L "$rollback_dir/${path##*/}" ]]; then
-      cp -a --remove-destination -- "$rollback_dir/${path##*/}" "$path" || return 1
+    if [[ -e "$rollback_dir/${path//\//_}" || -L "$rollback_dir/${path//\//_}" ]]; then
+      cp -a --remove-destination -- "$rollback_dir/${path//\//_}" "$path" || return 1
     else
       rm -f -- "$path" || return 1
     fi
